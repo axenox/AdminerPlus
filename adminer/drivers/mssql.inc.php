@@ -5,7 +5,7 @@
 * @author Jakub Vrana
 */
 
-$drivers["mssql"] = "MS SQL (beta)";
+$drivers["mssql"] = "Microsoft SQL Server";
 
 if (isset($_GET["mssql"])) {
 	define("DRIVER", "mssql");
@@ -25,7 +25,22 @@ if (isset($_GET["mssql"])) {
 			function connect($server, $username, $password) {
 				global $adminer;
 				$db = $adminer->database();
-				$connection_info = array("UID" => $username, "PWD" => $password, "CharacterSet" => "UTF-8");
+				if (false !== ($semicPos = mb_stripos($server, ';')) && false !== ($optionsPos = mb_stripos($server, 'Options={'))) {
+				    $connection_info = json_decode(mb_substr($server, ($optionsPos + strlen('Options='))), true);
+				    $server = mb_substr($server, 0, $semicPos);
+				} else {
+				    $connection_info = [];
+				}
+				if (! array_key_exists("CharacterSet", $connection_info)) {
+				    $connection_info["CharacterSet"] = "UTF-8";
+				}
+				if ($username !== '' && $username !== null) {
+				    $connection_info['UID'] = $username;
+				}
+				if ($password !== '' && $password !== null) {
+				    // Escape closing curly braces in MS SQL password by a second brace
+				    $connection_info['PWD'] = preg_replace('/([^}])}([^}])/', '\\1}}\\2', $password);;
+				}
 				if ($db != "") {
 					$connection_info["Database"] = $db;
 				}
@@ -287,7 +302,11 @@ if (isset($_GET["mssql"])) {
 
 	}
 
-
+	function idf_unescape_mssql($idf) {
+	    if (mb_substr($idf, 0, 1) === '[' && mb_substr($idf, -1) === ']');
+	    $idf = mb_substr($idf, 1, -1);
+	    return str_replace("]]", "]", $idf);
+	}
 
 	function idf_escape($idf) {
 		return "[" . str_replace("]", "]]", $idf) . "]";
@@ -378,6 +397,14 @@ WHERE o.schema_id = SCHEMA_ID(" . q(get_schema()) . ") AND o.type IN ('S', 'U', 
 		) as $row) {
 			$type = $row["type"];
 			$length = (preg_match("~char|binary~", $type) ? $row["max_length"] : ($type == "decimal" ? "$row[precision],$row[scale]" : ""));
+			// nvarchar seems to return twice the length, that was specified on creation.
+			if (($type === 'nvarchar' || $type === 'nchar' || $type === 'ntext') && is_numeric($length)) {
+			    if ($length === -1) {
+			        $length = 'max';
+			    } else {
+			        $length = $length / 2;
+			    }
+			}
 			$return[$row["name"]] = array(
 				"field" => $row["name"],
 				"full_type" => $type . ($length ? "($length)" : ""),
@@ -415,7 +442,7 @@ WHERE OBJECT_NAME(i.object_id) = " . q($table)
 
 	function view($name) {
 		global $connection;
-		return array("select" => preg_replace('~^(?:[^[]|\[[^]]*])*\s+AS\s+~isU', '', $connection->result("SELECT VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = SCHEMA_NAME() AND TABLE_NAME = " . q($name))));
+		return array("select" => preg_replace('~^(?:[^[]|\[[^]]*])*\s+AS\s+~isU', '', $connection->result("SELECT VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = '" . get_schema() . "' AND TABLE_NAME = " . q($name))));
 	}
 
 	function collations() {
@@ -432,7 +459,11 @@ WHERE OBJECT_NAME(i.object_id) = " . q($table)
 
 	function error() {
 		global $connection;
-		return nl_br(h(preg_replace('~^(\[[^]]*])+~m', '', $connection->error)));
+		// This is a workaround for $connection not having the error probably due to decoupling from
+		// the original instance in connect() method. In the minified version the connections is $g.
+		global $g;
+		$msg = $connection->error ? $connection->error : ($g ? $g->error : '');
+		return nl_br(h(preg_replace('~^(\[[^]]*])+~m', '', $msg)));
 	}
 
 	function create_database($db, $collation) {
@@ -472,7 +503,7 @@ WHERE OBJECT_NAME(i.object_id) = " . q($table)
 				} else {
 					unset($val[6]); //! identity can't be removed
 					if ($column != $val[0]) {
-						queries("EXEC sp_rename " . q(table($table) . ".$column") . ", " . q(idf_unescape($val[0])) . ", 'COLUMN'");
+					    queries("EXEC sp_rename " . q((get_schema() ? get_schema() . '.' : '') . "{$table}.{$field[0]}") . ", " . q(idf_unescape_mssql($val[0])) . ", 'COLUMN'");
 					}
 					$alter["ALTER COLUMN " . implode("", $val)][] = "";
 				}
@@ -488,7 +519,7 @@ WHERE OBJECT_NAME(i.object_id) = " . q($table)
 			$alter[""] = $foreign;
 		}
 		foreach ($alter as $key => $val) {
-			if (!queries("ALTER TABLE " . idf_escape($name) . " $key" . implode(",", $val))) {
+			if (!queries("ALTER TABLE " . table($name) . " $key" . implode(",", $val))) {
 				return false;
 			}
 		}
@@ -538,10 +569,18 @@ WHERE OBJECT_NAME(i.object_id) = " . q($table)
 	}
 
 	function foreign_keys($table) {
-		$return = array();
-		foreach (get_rows("EXEC sp_fkeys @fktable_name = " . q($table)) as $row) {
+	    global $adminer;
+	    $currentDB = $adminer->database();
+	    $schema = get_schema();
+	    if ($schema) {
+	        $owner = ", @fktable_owner = '{$schema}'";
+	    }
+	    $return = array();
+	    foreach (get_rows("EXEC sp_fkeys @fktable_name = " . q($table) . $owner) as $row) {
 			$foreign_key = &$return[$row["FK_NAME"]];
-			$foreign_key["db"] = $row["PKTABLE_QUALIFIER"];
+			// Make sure to leave db empty if it is the current DB as this is required to draw
+			// arrows in the DB schema diagram.
+			$foreign_key["db"] = $row["PKTABLE_QUALIFIER"] !== $currentDB ? $row["PKTABLE_QUALIFIER"] : "";
 			$foreign_key["table"] = $row["PKTABLE_NAME"];
 			$foreign_key["source"][] = $row["FKCOLUMN_NAME"];
 			$foreign_key["target"][] = $row["PKCOLUMN_NAME"];
@@ -633,12 +672,28 @@ WHERE sys1.xtype = 'TR' AND sys2.name = " . q($table)
 	function show_status() {
 		return array();
 	}
-
+	
 	function convert_field($field) {
+	    if (preg_match("~binary~", $field["type"])) {
+	        return "LOWER(CONVERT(VARCHAR(max), " . idf_escape($field["field"]) . ", 1))";
+	    }
 	}
-
+	
+	/** Convert value in edit after applying functions back
+	 * @param array one element from fields()
+	 * @param string
+	 * @return string
+	 */
 	function unconvert_field($field, $return) {
-		return $return;
+	    if (preg_match("~binary~", $field["type"])) {
+	        if (strcasecmp(mb_substr($return, 0, 2), '0x') === 0) {
+	            return $return;
+	        } else {
+	            // TODO How to UNHEX() in MS SQL?
+	            // $return = "UNHEX($return)";
+	        }
+	    }
+	    return $return;
 	}
 
 	function support($feature) {
@@ -651,7 +706,7 @@ WHERE sys1.xtype = 'TR' AND sys2.name = " . q($table)
 		foreach (array( //! use sys.types
 			lang('Numbers') => array("tinyint" => 3, "smallint" => 5, "int" => 10, "bigint" => 20, "bit" => 1, "decimal" => 0, "real" => 12, "float" => 53, "smallmoney" => 10, "money" => 20),
 			lang('Date and time') => array("date" => 10, "smalldatetime" => 19, "datetime" => 19, "datetime2" => 19, "time" => 8, "datetimeoffset" => 10),
-			lang('Strings') => array("char" => 8000, "varchar" => 8000, "text" => 2147483647, "nchar" => 4000, "nvarchar" => 4000, "ntext" => 1073741823),
+			lang('Strings') => array("char" => 8000, "varchar" => 8000, "text" => 2147483647, "nchar" => 4000, "nvarchar" => 4000, "nvarchar(max)" => "max", "ntext" => 1073741823),
 			lang('Binary') => array("binary" => 8000, "varbinary" => 8000, "image" => 2147483647),
 		) as $key => $val) {
 			$types += $val;
